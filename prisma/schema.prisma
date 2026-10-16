@@ -1,0 +1,867 @@
+// Malique Oil and Gas — Prisma Schema
+// Multi-Branch LPG Station Management Platform
+// Target: Neon DB (PostgreSQL) + NestJS API
+
+generator client {
+  provider = "prisma-client-js"
+  // "native" covers local dev (Windows/macOS); the Linux targets let the same
+  // generated client run on serverless hosts such as the Vercel Node runtime.
+  binaryTargets = ["native", "linux-musl-openssl-3.0.x", "debian-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─── Enums ───────────────────────────────────────────────
+
+enum UserRole {
+  super_admin
+  admin
+  branch_manager
+  staff
+  rider
+}
+
+enum AuditActionType {
+  login
+  logout
+  create
+  update
+  delete
+  read
+  other
+}
+
+enum UserStatus {
+  active
+  inactive
+  suspended
+}
+
+enum ProductCategory {
+  refill
+  new_cylinder
+  accessory
+}
+
+enum OrderType {
+  online
+  phone
+  walk_in
+}
+
+enum OrderStatus {
+  pending
+  confirmed
+  preparing
+  out_for_delivery
+  delivered
+  cancelled
+}
+
+enum PaymentStatusType {
+  pending
+  paid
+  partial
+  refunded
+}
+
+enum PaymentMethodType {
+  online
+  cash
+  transfer
+  pos
+}
+
+enum PaymentRecordStatus {
+  pending
+  success
+  failed
+  refunded
+}
+
+enum CylinderStatus {
+  in_stock
+  filled
+  empty
+  in_transit
+  lost
+}
+
+enum CylinderType {
+  refill
+  new
+}
+
+enum DeliveryStatus {
+  assigned
+  picked_up
+  in_transit
+  delivered
+  failed
+  returned
+}
+
+enum DeliveryPriority {
+  low
+  normal
+  high
+}
+
+enum ShiftType {
+  morning
+  afternoon
+  night
+  full_day
+}
+
+enum AttendanceStatus {
+  present
+  late
+  absent
+  half_day
+}
+
+enum AttendanceVerification {
+  qr
+  pin
+  manual
+  admin
+}
+
+enum ShiftAssignmentStatus {
+  scheduled
+  present
+  absent
+  swapped
+}
+
+enum LeaveType {
+  annual
+  sick
+  emergency
+  maternity
+  unpaid
+}
+
+enum LeaveStatus {
+  pending
+  approved
+  rejected
+}
+
+enum PayrollStatus {
+  draft
+  approved
+  paid
+}
+
+// Auditable payroll line items (Phase 6). A Payroll row is the period
+// aggregate; PayrollEntry rows are the individual components that make it up.
+enum PayrollEntryType {
+  basic
+  allowance
+  deduction
+  overtime
+  bonus
+  increment
+  penalty
+}
+
+enum NotificationType {
+  order
+  attendance
+  payment
+  system
+  delivery
+  inventory
+}
+
+enum BranchStatus {
+  active
+  inactive
+  maintenance
+}
+
+enum GasReconciliationStatus {
+  ok
+  warning
+  critical
+}
+
+enum ContactSource {
+  website
+  admin
+}
+
+enum ContactStatus {
+  new
+  read
+  replied
+  archived
+}
+
+enum AnnouncementType {
+  general
+  stock
+  promo
+  price
+  news
+}
+
+enum AnnouncementStatus {
+  draft
+  published
+  archived
+}
+
+// ─── Models ──────────────────────────────────────────────
+
+model Branch {
+  id               String       @id @default(uuid())
+  name             String
+  address          String
+  city             String?
+  managerName      String?      @map("manager_name")
+  phone            String?
+  email            String?
+  latitude         Float?
+  longitude        Float?
+  operatingHours   Json         @default("{\"mon\":\"08:00-20:00\",\"tue\":\"08:00-20:00\",\"wed\":\"08:00-20:00\",\"thu\":\"08:00-20:00\",\"fri\":\"08:00-20:00\",\"sat\":\"08:00-18:00\",\"sun\":\"closed\"}")
+  status           BranchStatus @default(active)
+  deliveryRadiusKm Decimal      @default(25.00) @db.Decimal(5, 2)
+  createdAt        DateTime     @default(now())
+  updatedAt        DateTime     @updatedAt
+
+  users            User[]
+  customers        Customer[]
+  productPrices    ProductPrice[]
+  inventory        Inventory[]
+  bulkStorage      BulkStorage[]
+  orders           Order[]
+  cylinders        Cylinder[]
+  deliveries       Delivery[]
+  shifts           Shift[]
+  attendance       Attendance[]
+  leaveRequests    LeaveRequest[]
+  performanceReviews PerformanceReview[]
+  payroll          Payroll[]
+  settings         Setting[]
+  gasPurchases     GasPurchase[]
+  tankReadings     TankReading[]
+  cylinderFills    CylinderFill[]
+  gasReconciliations GasReconciliation[]
+  shiftAssignments ShiftAssignment[]
+
+  @@map("malique_branches")
+}
+
+model User {
+  id        String     @id @default(uuid())
+  email     String     @unique
+  password  String
+  fullName  String     @map("full_name")
+  phone     String?
+  role      UserRole   @default(staff)
+  branchId  String?    @map("branch_id")
+  avatarUrl String?    @map("avatar_url")
+  status    UserStatus @default(active)
+  lastLogin DateTime?  @map("last_login")
+  staffCode String?    @unique @map("staff_code")
+  pinHash   String?    @map("pin_hash")
+  baseSalary Decimal?  @db.Decimal(12, 2) @map("base_salary")
+  jobTitle  String?    @map("job_title")
+  hireDate  DateTime?  @db.Date @map("hire_date")
+  createdAt DateTime   @default(now()) @map("created_at")
+  updatedAt DateTime   @updatedAt @map("updated_at")
+
+  branch    Branch?    @relation(fields: [branchId], references: [id], onDelete: SetNull)
+  attendance Attendance[]
+  leaveRequests LeaveRequest[]
+  performanceReviews PerformanceReview[]
+  payroll      Payroll[]
+  payrollEntries PayrollEntry[]
+  shiftAssignments ShiftAssignment[]
+  pushSubscriptions PushSubscription[]
+
+  @@map("malique_users")
+}
+
+// Dedicated store for password-reset tokens so we no longer hijack the
+// phone/notes columns. Tokens are hashed at rest and single-use.
+model PasswordResetToken {
+  id        String    @id @default(uuid())
+  email     String
+  tokenHash String    @map("token_hash")
+  expiresAt DateTime  @map("expires_at")
+  usedAt    DateTime? @map("used_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  @@index([email])
+  @@index([tokenHash])
+  @@map("malique_password_reset_tokens")
+}
+
+// Customer communications inbox (Phase 9). Public messages arrive from the web
+// contact form; staff can be the sender too (source admin). A reply records the
+// response text + who sent it and when, without deleting the original message.
+model ContactMessage {
+  id             String        @id @default(uuid())
+  name           String?
+  email          String?
+  phone          String?
+  subject        String?
+  message        String
+  source         ContactSource @default(website)
+  status         ContactStatus @default(new)
+  relatedOrderId String?       @map("related_order_id")
+  repliedById    String?       @map("replied_by_id")
+  repliedAt      DateTime?     @map("replied_at")
+  response       String?
+  createdAt      DateTime      @default(now()) @map("created_at")
+  updatedAt      DateTime      @updatedAt @map("updated_at")
+
+  @@index([status])
+  @@index([createdAt])
+  @@map("malique_contact_messages")
+}
+
+model Announcement {
+  id            String             @id @default(uuid())
+  title         String
+  body          String
+  type          AnnouncementType   @default(general)
+  status        AnnouncementStatus @default(published)
+  pinned        Boolean            @default(false)
+  linkLabel     String?            @map("link_label")
+  linkUrl       String?            @map("link_url")
+  startsAt      DateTime?          @map("starts_at")
+  endsAt        DateTime?          @map("ends_at")
+  publishedById String?            @map("published_by_id")
+  publishedAt   DateTime?          @map("published_at")
+  createdAt     DateTime           @default(now()) @map("created_at")
+  updatedAt     DateTime           @updatedAt @map("updated_at")
+
+  @@index([status])
+  @@index([startsAt, endsAt])
+  @@map("malique_announcements")
+}
+
+model Customer {
+  id              String    @id @default(uuid())
+  userId          String?   @unique @map("user_id")
+  email           String    @unique
+  password        String
+  fullName        String    @map("full_name")
+  phone           String
+  address         String?
+  defaultBranchId String?   @map("default_branch_id")
+  latitude        Float?
+  longitude       Float?
+  loyaltyPoints   Int       @default(0) @map("loyalty_points")
+  totalSpent      Decimal   @default(0) @db.Decimal(12, 2) @map("total_spent")
+  orderCount      Int       @default(0) @map("order_count")
+  notes           String?
+  savedAddresses  Json      @default("[]") @map("saved_addresses")
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+
+  defaultBranch   Branch?   @relation(fields: [defaultBranchId], references: [id], onDelete: SetNull)
+  orders          Order[]
+
+  @@map("malique_customers")
+}
+
+model Product {
+  id          String          @id @default(uuid())
+  name        String
+  category    ProductCategory
+  sizes       Float[]         @default([])
+  basePrice   Decimal         @default(0) @map("base_price") @db.Decimal(10, 2)
+  description String?
+  isActive    Boolean         @default(true) @map("is_active")
+  imageUrl    String?         @map("image_url")
+  createdAt   DateTime        @default(now()) @map("created_at")
+  updatedAt   DateTime        @updatedAt @map("updated_at")
+
+  prices      ProductPrice[]
+  inventory   Inventory[]
+  orderItems  OrderItem[]
+
+  @@map("malique_products")
+}
+
+model ProductPrice {
+  id            String   @id @default(uuid())
+  productId     String   @map("product_id")
+  branchId      String   @map("branch_id")
+  sizeKg        Decimal  @map("size_kg") @db.Decimal(5, 1)
+  price         Decimal  @db.Decimal(10, 2)
+  costPrice     Decimal  @default(0) @map("cost_price") @db.Decimal(10, 2)
+  effectiveFrom DateTime @default(now()) @map("effective_from") @db.Date
+  effectiveTo   DateTime? @map("effective_to") @db.Date
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  product       Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  branch        Branch   @relation(fields: [branchId], references: [id], onDelete: Cascade)
+
+  @@unique([productId, branchId, sizeKg, effectiveFrom])
+  @@map("malique_product_prices")
+}
+
+model Inventory {
+  id              String   @id @default(uuid())
+  branchId        String   @map("branch_id")
+  productId       String   @map("product_id")
+  sizeKg          Decimal  @map("size_kg") @db.Decimal(5, 1)
+  quantityOnHand  Int      @default(0) @map("quantity_on_hand")
+  minStockLevel   Int      @default(5) @map("min_stock_level")
+  maxCapacity     Int      @default(500) @map("max_capacity")
+  lastRestockedAt DateTime? @map("last_restocked_at")
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  branch          Branch   @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  product         Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@unique([branchId, productId, sizeKg])
+  @@map("malique_inventory")
+}
+
+model BulkStorage {
+  id                String   @id @default(uuid())
+  branchId          String   @map("branch_id")
+  tankName          String   @map("tank_name")
+  capacityLiters    Decimal  @map("capacity_liters") @db.Decimal(10, 2)
+  currentVolumeL    Decimal  @default(0) @map("current_volume_liters") @db.Decimal(10, 2)
+  lastMeasurementAt DateTime? @map("last_measurement_at")
+  measuredBy        String?  @map("measured_by")
+  createdAt         DateTime @default(now()) @map("created_at")
+  updatedAt         DateTime @updatedAt @map("updated_at")
+
+  branch            Branch   @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  tankReadings      TankReading[]
+
+  @@map("malique_bulk_storage")
+}
+
+model Order {
+  id            String           @id @default(uuid())
+  orderNumber   String           @unique @map("order_number")
+  customerId    String           @map("customer_id")
+  branchId      String           @map("branch_id")
+  orderType     OrderType        @default(online) @map("order_type")
+  status        OrderStatus      @default(pending)
+  subtotal      Decimal          @default(0) @db.Decimal(10, 2)
+  deliveryFee   Decimal          @default(0) @map("delivery_fee") @db.Decimal(10, 2)
+  discount      Decimal          @default(0) @db.Decimal(10, 2)
+  totalAmount   Decimal          @default(0) @map("total_amount") @db.Decimal(10, 2)
+  paymentStatus PaymentStatusType @default(pending) @map("payment_status")
+  paymentMethod PaymentMethodType? @map("payment_method")
+  notes         String?
+  createdBy     String?          @map("created_by")
+  deliveredAt   DateTime?        @map("delivered_at")
+  cancelledAt   DateTime?        @map("cancelled_at")
+  cancelReason  String?          @map("cancel_reason")
+  createdAt     DateTime         @default(now()) @map("created_at")
+  updatedAt     DateTime         @updatedAt @map("updated_at")
+
+  customer      Customer         @relation(fields: [customerId], references: [id])
+  branch        Branch           @relation(fields: [branchId], references: [id])
+  items         OrderItem[]
+  delivery      Delivery?
+  payments      Payment[]
+
+  @@index([branchId, createdAt])
+  @@index([createdBy, createdAt])
+  @@map("malique_orders")
+}
+
+model OrderItem {
+  id            String   @id @default(uuid())
+  orderId       String   @map("order_id")
+  productId     String   @map("product_id")
+  sizeKg        Decimal  @map("size_kg") @db.Decimal(5, 1)
+  quantity      Int      @default(1)
+  unitPrice     Decimal  @map("unit_price") @db.Decimal(10, 2)
+  totalPrice    Decimal  @map("total_price") @db.Decimal(10, 2)
+  isRefill      Boolean  @default(false) @map("is_refill")
+  cylinderSerial String? @map("cylinder_serial")
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  order         Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  product       Product  @relation(fields: [productId], references: [id])
+
+  @@map("malique_order_items")
+}
+
+model Cylinder {
+  id              String         @id @default(uuid())
+  serialNumber    String         @unique @map("serial_number")
+  sizeKg          Decimal        @map("size_kg") @db.Decimal(5, 1)
+  cylinderType    CylinderType   @default(new) @map("cylinder_type")
+  status          CylinderStatus @default(in_stock)
+  branchId        String?        @map("branch_id")
+  ownerCustomerId String?        @map("owner_customer_id")
+  purchaseDate    DateTime?      @map("purchase_date") @db.Date
+  lastFilledAt    DateTime?      @map("last_filled_at")
+  lastInspectedAt DateTime?      @map("last_inspected_at")
+  inspectionDue   DateTime?      @map("inspection_due_date") @db.Date
+  createdAt       DateTime       @default(now()) @map("created_at")
+  updatedAt       DateTime       @updatedAt @map("updated_at")
+
+  branch          Branch?        @relation(fields: [branchId], references: [id], onDelete: SetNull)
+  fills           CylinderFill[]
+
+  @@map("malique_cylinders")
+}
+
+model Delivery {
+  id              String         @id @default(uuid())
+  orderId         String         @unique @map("order_id")
+  riderId         String         @map("rider_id")
+  pickupBranchId  String         @map("pickup_branch_id")
+  deliveryAddress String         @map("delivery_address")
+  deliveryLat     Float?         @map("delivery_latitude")
+  deliveryLng     Float?         @map("delivery_longitude")
+  distanceKm      Decimal?       @map("distance_km") @db.Decimal(6, 2)
+  estimatedTime   Int?           // minutes
+  actualTime      Int?           // minutes
+  status          DeliveryStatus @default(assigned)
+  pickupTime      DateTime?      @map("pickup_time")
+  deliveredAt     DateTime?      @map("delivered_at")
+  deliveryFee     Decimal        @default(0) @map("delivery_fee") @db.Decimal(10, 2)
+  riderNote       String?        @map("rider_note")
+  failureReason   String?        @map("failure_reason")
+  scheduledAt     DateTime?      @map("scheduled_at")
+  dispatchedAt    DateTime?      @map("dispatched_at")
+  priority        DeliveryPriority @default(normal)
+  windowLabel     String?        @map("window_label")
+  notes           String?
+  createdAt       DateTime       @default(now()) @map("created_at")
+  updatedAt       DateTime       @updatedAt @map("updated_at")
+
+  order           Order          @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  pickupBranch    Branch         @relation(fields: [pickupBranchId], references: [id])
+
+  @@map("malique_deliveries")
+}
+
+model Payment {
+  id            String              @id @default(uuid())
+  orderId       String              @map("order_id")
+  amount        Decimal             @db.Decimal(10, 2)
+  paymentMethod PaymentMethodType   @map("payment_method")
+  transactionRef String?            @map("transaction_ref")
+  gateway       String?
+  status        PaymentRecordStatus @default(pending)
+  paidAt        DateTime?           @map("paid_at")
+  confirmedBy   String?             @map("confirmed_by")
+  receiptUrl    String?             @map("receipt_url")
+  metadata      Json                @default("{}")
+  createdAt     DateTime            @default(now()) @map("created_at")
+  updatedAt     DateTime            @updatedAt @map("updated_at")
+
+  order         Order               @relation(fields: [orderId], references: [id])
+
+  @@map("malique_payments")
+}
+
+// Web-push endpoints registered by staff (mostly riders) so dispatch alerts
+// reach their phones the moment a job is assigned.
+model PushSubscription {
+  id        String   @id @default(uuid())
+  userId    String   @map("user_id")
+  endpoint  String   @unique
+  keys      Json
+  createdAt DateTime @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("malique_push_subscriptions")
+}
+
+model Attendance {
+  id         String           @id @default(uuid())
+  userId     String           @map("user_id")
+  branchId   String           @map("branch_id")
+  clockIn    DateTime         @default(now()) @map("clock_in")
+  clockOut   DateTime?        @map("clock_out")
+  shiftType  ShiftType        @default(full_day) @map("shift_type")
+  breakStart DateTime?        @map("break_start") @db.Time
+  breakEnd   DateTime?        @map("break_end") @db.Time
+  totalHours Decimal          @default(0) @map("total_hours") @db.Decimal(5, 2)
+  status     AttendanceStatus @default(present)
+  notes      String?
+  verificationMethod AttendanceVerification? @map("verification_method")
+  pinVerified Boolean?        @map("pin_verified")
+  deviceInfo String?          @map("device_info")
+  location   String?
+  createdAt  DateTime         @default(now()) @map("created_at")
+  updatedAt  DateTime         @updatedAt @map("updated_at")
+
+  branch    Branch     @relation(fields: [branchId], references: [id])
+  user      User       @relation(fields: [userId], references: [id])
+
+  @@map("malique_attendance")
+}
+
+model Shift {
+  id          String   @id @default(uuid())
+  branchId    String   @map("branch_id")
+  name        String
+  startTime   DateTime @map("start_time") @db.Time
+  endTime     DateTime @map("end_time") @db.Time
+  minStaff    Int      @default(1) @map("min_staff")
+  capacity    Int?     @map("capacity")
+  isDefault   Boolean  @default(false) @map("is_default")
+  description String?
+  isActive    Boolean  @default(true) @map("is_active")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  branch      Branch   @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  assignments ShiftAssignment[]
+
+  @@map("malique_shifts")
+}
+
+// Day-level roster link: which staff is scheduled to which shift on a date.
+model ShiftAssignment {
+  id        String                @id @default(uuid())
+  shiftId   String                @map("shift_id")
+  userId    String                @map("user_id")
+  branchId  String                @map("branch_id")
+  workDate  DateTime              @db.Date @map("work_date")
+  status    ShiftAssignmentStatus @default(scheduled)
+  note      String?
+  createdAt DateTime              @default(now()) @map("created_at")
+  updatedAt DateTime              @updatedAt @map("updated_at")
+
+  shift     Shift                 @relation(fields: [shiftId], references: [id], onDelete: Cascade)
+  user      User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  branch    Branch                @relation(fields: [branchId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, workDate, shiftId])
+  @@index([branchId, workDate])
+  @@map("malique_shift_assignments")
+}
+
+model LeaveRequest {
+  id         String     @id @default(uuid())
+  userId     String     @map("user_id")
+  branchId   String     @map("branch_id")
+  leaveType  LeaveType  @map("leave_type")
+  startDate  DateTime   @map("start_date") @db.Date
+  endDate    DateTime   @map("end_date") @db.Date
+  daysCount  Decimal    @map("days_count") @db.Decimal(4, 1)
+  reason     String
+  status     LeaveStatus @default(pending)
+  approvedBy String?    @map("approved_by")
+  createdAt  DateTime   @default(now()) @map("created_at")
+  updatedAt  DateTime   @updatedAt @map("updated_at")
+
+  branch     Branch     @relation(fields: [branchId], references: [id])
+  user       User       @relation(fields: [userId], references: [id])
+
+  @@map("malique_leave_requests")
+}
+
+model PerformanceReview {
+  id              String   @id @default(uuid())
+  userId          String   @map("user_id")
+  branchId        String   @map("branch_id")
+  reviewPeriodStart DateTime @map("review_period_start") @db.Date
+  reviewPeriodEnd   DateTime @map("review_period_end") @db.Date
+  totalSales      Decimal  @default(0) @map("total_sales") @db.Decimal(12, 2)
+  totalOrders     Int      @default(0) @map("total_orders")
+  attendanceRate  Decimal  @default(0) @map("attendance_rate") @db.Decimal(5, 2)
+  customerRating  Decimal? @default(0) @map("customer_rating") @db.Decimal(3, 2)
+  managerNotes    String?  @map("manager_notes")
+  score           Decimal? @default(0) @db.Decimal(5, 2)
+  reviewedBy      String?  @map("reviewed_by")
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  branch          Branch   @relation(fields: [branchId], references: [id])
+  user            User     @relation(fields: [userId], references: [id])
+
+  @@map("malique_performance_reviews")
+}
+
+model Payroll {
+  id            String       @id @default(uuid())
+  userId        String       @map("user_id")
+  branchId      String       @map("branch_id")
+  period        DateTime     @db.Date
+  basicSalary   Decimal      @default(0) @map("basic_salary") @db.Decimal(10, 2)
+  allowances    Decimal      @default(0) @db.Decimal(10, 2)
+  deductions    Decimal      @default(0) @db.Decimal(10, 2)
+  overtimeHours Decimal      @default(0) @map("overtime_hours") @db.Decimal(5, 2)
+  overtimePay   Decimal      @default(0) @map("overtime_pay") @db.Decimal(10, 2)
+  bonus         Decimal      @default(0) @db.Decimal(10, 2)
+  status        PayrollStatus @default(draft)
+  approvedBy    String?      @map("approved_by")
+  paidAt        DateTime?    @map("paid_at")
+  createdAt     DateTime     @default(now()) @map("created_at")
+  updatedAt     DateTime     @updatedAt @map("updated_at")
+
+  branch        Branch       @relation(fields: [branchId], references: [id])
+  user          User         @relation(fields: [userId], references: [id])
+  entries       PayrollEntry[]
+
+  @@unique([userId, period])
+  @@map("malique_payroll")
+}
+
+// Individual, auditable components of a payslip. Negative-impact items
+// (deduction/penalty) are stored as positive amounts and subtracted by the
+// engine based on `type`, so history stays immutable and re-computable.
+model PayrollEntry {
+  id           String           @id @default(uuid())
+  payrollId    String?          @map("payroll_id")
+  userId       String           @map("user_id")
+  period       DateTime         @db.Date
+  type         PayrollEntryType
+  amount       Decimal          @db.Decimal(12, 2)
+  reason       String?
+  approvedById String?          @map("approved_by_id")
+  createdAt    DateTime         @default(now()) @map("created_at")
+
+  payroll      Payroll?         @relation(fields: [payrollId], references: [id], onDelete: SetNull)
+  user         User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, period])
+  @@index([payrollId])
+  @@map("malique_payroll_entries")
+}
+
+model Setting {
+  id        String   @id @default(uuid())
+  branchId  String?  @map("branch_id")
+  key       String
+  value     Json     @default("{}")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  branch    Branch?  @relation(fields: [branchId], references: [id], onDelete: Cascade)
+
+  @@unique([key, branchId])
+  @@map("malique_settings")
+}
+
+// ─── Gas Mass-Balance ────────────────────────────────────
+// Tracks what the company bought (intake), dispensed into cylinders,
+// and what remains in bulk tanks, so shrinkage can be reconciled.
+
+// Stock-in: a delivery of gas purchased from a supplier into a branch.
+model GasPurchase {
+  id            String   @id @default(uuid())
+  branchId      String   @map("branch_id")
+  supplierName  String   @map("supplier_name")
+  purchaseDate  DateTime @db.Date @map("purchase_date")
+  volumeKg      Decimal  @map("volume_kg") @db.Decimal(12, 3)
+  unitCost      Decimal  @default(0) @map("unit_cost") @db.Decimal(12, 2)
+  totalCost     Decimal  @default(0) @map("total_cost") @db.Decimal(14, 2)
+  documentUrl   String?  @map("document_url")
+  recordedById  String?  @map("recorded_by_id")
+  notes         String?
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  branch        Branch   @relation(fields: [branchId], references: [id], onDelete: Cascade)
+
+  @@index([branchId])
+  @@index([purchaseDate])
+  @@map("malique_gas_purchases")
+}
+
+// A physical gauge reading of a bulk tank at a point in time.
+model TankReading {
+  id            String       @id @default(uuid())
+  bulkStorageId String?      @map("bulk_storage_id")
+  branchId      String       @map("branch_id")
+  readAt        DateTime     @map("read_at")
+  volumeLiters  Decimal      @map("volume_liters") @db.Decimal(12, 3)
+  measuredById  String?      @map("measured_by_id")
+  note          String?
+  createdAt     DateTime     @default(now()) @map("created_at")
+
+  bulkStorage   BulkStorage? @relation(fields: [bulkStorageId], references: [id], onDelete: SetNull)
+  branch        Branch       @relation(fields: [branchId], references: [id], onDelete: Cascade)
+
+  @@index([branchId])
+  @@index([readAt])
+  @@map("malique_tank_readings")
+}
+
+// Gas actually dispensed into a cylinder (the outflow we can meter).
+model CylinderFill {
+  id            String    @id @default(uuid())
+  cylinderId    String    @map("cylinder_id")
+  branchId      String    @map("branch_id")
+  filledKg      Decimal   @map("filled_kg") @db.Decimal(8, 3)
+  filledAt      DateTime  @map("filled_at")
+  filledById    String?   @map("filled_by_id")
+  fromReadingId String?   @map("from_reading_id")
+  createdAt     DateTime  @default(now()) @map("created_at")
+
+  cylinder      Cylinder  @relation(fields: [cylinderId], references: [id], onDelete: Cascade)
+  branch        Branch    @relation(fields: [branchId], references: [id], onDelete: Cascade)
+
+  @@index([branchId])
+  @@index([filledAt])
+  @@map("malique_cylinder_fills")
+}
+
+// A stored periodic reconciliation snapshot for accountability/history.
+model GasReconciliation {
+  id          String                  @id @default(uuid())
+  branchId    String                  @map("branch_id")
+  periodStart DateTime                @db.Date @map("period_start")
+  periodEnd   DateTime                @db.Date @map("period_end")
+  openingKg   Decimal                 @map("opening_kg") @db.Decimal(12, 3)
+  purchasesKg Decimal                 @map("purchases_kg") @db.Decimal(12, 3)
+  dispensedKg Decimal                 @default(0) @map("dispensed_kg") @db.Decimal(12, 3)
+  closingKg   Decimal                 @map("closing_kg") @db.Decimal(12, 3)
+  expectedKg  Decimal                 @map("expected_kg") @db.Decimal(12, 3)
+  varianceKg  Decimal                 @map("variance_kg") @db.Decimal(12, 3)
+  variancePct Decimal                 @map("variance_pct") @db.Decimal(8, 4)
+  status      GasReconciliationStatus @default(ok)
+  createdAt   DateTime                @default(now()) @map("created_at")
+
+  branch      Branch                  @relation(fields: [branchId], references: [id], onDelete: Cascade)
+
+  @@index([branchId])
+  @@index([createdAt])
+  @@map("malique_gas_reconciliations")
+}
+
+// ─── Audit Log ───────────────────────────────────────────
+// Records every state-changing action performed by portal users.
+// super_admin (dev) actions are intentionally never written here.
+model AuditLog {
+  id         String          @id @default(uuid())
+  actorId    String?         @map("actor_id")
+  actorEmail String?         @map("actor_email")
+  actorName  String?         @map("actor_name")
+  actorRole  String?         @map("actor_role")
+  actionType AuditActionType @default(other) @map("action_type")
+  action     String
+  resource   String?
+  method     String?
+  path       String?
+  payload    Json?
+  ip         String?
+  userAgent  String?         @map("user_agent")
+  statusCode Int?            @map("status_code")
+  success    Boolean         @default(true)
+  createdAt  DateTime        @default(now()) @map("created_at")
+
+  @@index([actorId])
+  @@index([actionType])
+  @@index([createdAt])
+  @@map("malique_audit_logs")
+}
