@@ -3,6 +3,7 @@ import type { Response } from 'express';
 import { PrismaService } from '../prisma/prisma.service';
 import { GasService } from '../gas/gas.service';
 import { PayrollService } from '../payroll/payroll.service';
+import { AdminService } from '../admin/admin.service';
 import {
   ReportQueryDto,
   toRange,
@@ -66,6 +67,7 @@ export class ReportsService {
     private readonly prisma: PrismaService,
     private readonly gas: GasService,
     private readonly payroll: PayrollService,
+    private readonly admin: AdminService,
   ) {}
 
   // ─── Data builders ─────────────────────────────────────
@@ -138,7 +140,7 @@ export class ReportsService {
   }
 
   private async attendanceData(q: ReportQueryDto): Promise<ReportDataset> {
-    const where: any = {};
+    const where: any = { deletedAt: null };
     const range = toRange(q.from, q.to);
     if (Object.keys(range).length) where.clockIn = range;
     const bid = await this.resolveBranchId(q.branchId);
@@ -290,7 +292,7 @@ export class ReportsService {
   }
 
   private async customersData(q: ReportQueryDto): Promise<ReportDataset> {
-    const where: any = {};
+    const where: any = { deletedAt: null };
     const ids = parseIds(q.ids);
     if (ids.length) where.id = { in: ids };
     if (q.search) {
@@ -354,7 +356,7 @@ export class ReportsService {
   }
 
   private async inventoryData(q: ReportQueryDto): Promise<ReportDataset> {
-    const where: any = {};
+    const where: any = { deletedAt: null };
     const ids = parseIds(q.ids);
     if (ids.length) where.id = { in: ids };
     const bid = await this.resolveBranchId(q.branchId);
@@ -614,6 +616,103 @@ export class ReportsService {
     if (kind === 'pos-sales' && q.mine !== 'false') q.staffId = user.id;
   }
 
+  private async shiftsData(q: ReportQueryDto): Promise<ReportDataset> {
+    const where: any = {};
+    const range = toRange(q.from, q.to);
+    if (Object.keys(range).length) where.workDate = range;
+    const bid = await this.resolveBranchId(q.branchId);
+    if (bid) where.branchId = bid;
+    if (q.status && q.status !== 'all') where.status = q.status;
+    if (q.search) where.user = { fullName: { contains: q.search, mode: 'insensitive' } };
+
+    const rows = await this.prisma.shiftAssignment.findMany({
+      where,
+      include: {
+        user: { select: { fullName: true } },
+        branch: { select: { name: true } },
+        shift: { select: { name: true, startTime: true, endTime: true } },
+      },
+      orderBy: { workDate: 'desc' },
+      take: 3000,
+    });
+    const clock = (d: Date | null | undefined) =>
+      d ? new Date(d).toLocaleTimeString('en-NG', { hour: '2-digit', minute: '2-digit' }) : '—';
+
+    return {
+      title: 'Shift Roster Report',
+      subtitle: `Staff assignments · ${rangeLabel(q)}`,
+      meta: [{ label: 'Assignments', value: String(rows.length) }],
+      headers: ['Staff', 'Branch', 'Date', 'Shift', 'Start', 'End', 'Status'],
+      rows: rows.map((a: any) => [
+        a.user?.fullName ?? '—',
+        a.branch?.name ?? '—',
+        day(a.workDate),
+        a.shift?.name ?? '—',
+        clock(a.shift?.startTime),
+        clock(a.shift?.endTime),
+        a.status,
+      ]),
+      numericCols: [],
+    };
+  }
+
+  // Mirrors the analytics page: summary KPIs, 6-month series, branch table and
+  // top products flattened into one Section/Label/Revenue/Orders sheet.
+  private async analyticsData(q: ReportQueryDto): Promise<ReportDataset> {
+    const a = await this.admin.analytics({ branchId: q.branchId, from: q.from, to: q.to });
+    const rows: (string | number)[][] = [
+      ['Summary', 'Total', a.revenue.total, a.orders.total],
+      ['Summary', 'This month', a.revenue.thisMonth, a.orders.thisMonth],
+      ['Summary', 'Last month', a.revenue.lastMonth, a.orders.lastMonth],
+      ['Summary', 'Average order value', a.avgOrderValue, ''],
+    ];
+    for (const m of a.monthlyRevenue) rows.push(['Monthly', m.month, m.revenue, m.orders]);
+    for (const b of a.branchPerformance) rows.push(['Branch', b.branchName, b.revenue, b.orders]);
+    for (const p of a.topProducts) rows.push(['Top product', p.name, p.revenue, p.quantity]);
+    return {
+      title: 'Analytics Report',
+      subtitle: `Business performance · ${rangeLabel(q)}`,
+      meta: [
+        { label: 'Revenue (₦)', value: money(a.revenue.total).toLocaleString('en-NG') },
+        { label: 'Orders', value: String(a.orders.total) },
+      ],
+      headers: ['Section', 'Label', 'Revenue (₦)', 'Orders / Qty'],
+      rows,
+      numericCols: [2, 3],
+    };
+  }
+
+  // Overview snapshot matching the dashboard command centre: KPI tiles, order
+  // status split and the low-stock watch list.
+  private async dashboardData(q: ReportQueryDto): Promise<ReportDataset> {
+    const d = await this.admin.dashboard({ branchId: q.branchId, from: q.from, to: q.to });
+    const k = d.kpis;
+    const rows: (string | number)[][] = [
+      ['KPI', 'Total revenue (₦)', k.totalRevenue, ''],
+      ['KPI', `Revenue this month (${k.monthRevenueLabel})`, k.monthlyRevenue, ''],
+      ['KPI', 'Total orders', k.totalOrders, k.ordersGrowth],
+      ['KPI', 'Average order value (₦)', k.avgOrderValue, ''],
+      ['KPI', 'Active branches', k.activeBranches, ''],
+      ['KPI', 'Customers', k.totalCustomers, ''],
+      ['KPI', 'Staff clocked in now', k.clockedInNow, ''],
+    ];
+    for (const s of d.analytics.orderStatusBreakdown)
+      rows.push(['Order status', s.status, s.count, `${s.percentage}%`]);
+    for (const i of d.lowStockItems)
+      rows.push(['Low stock', `${i.productName} · ${i.branchName}`, i.currentStock, `min ${i.minStock}`]);
+    return {
+      title: 'Dashboard Snapshot',
+      subtitle: `Command centre overview · ${rangeLabel(q)}`,
+      meta: [
+        { label: 'Revenue (₦)', value: money(k.totalRevenue).toLocaleString('en-NG') },
+        { label: 'Orders', value: String(k.totalOrders) },
+      ],
+      headers: ['Block', 'Item', 'Value', 'Note'],
+      rows,
+      numericCols: [2],
+    };
+  }
+
   private async build(kind: string, q: ReportQueryDto): Promise<ReportDataset> {
     switch (kind) {
       case 'sales':
@@ -624,6 +723,12 @@ export class ReportsService {
         return this.attendanceData(q);
       case 'payroll':
         return this.payrollData(q);
+      case 'shifts':
+        return this.shiftsData(q);
+      case 'analytics':
+        return this.analyticsData(q);
+      case 'dashboard':
+        return this.dashboardData(q);
       case 'orders':
         return this.ordersData(q, false);
       case 'pos-sales':

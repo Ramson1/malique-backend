@@ -5,8 +5,12 @@ import { UpdateDeliveryStatusDto } from './dto/update-delivery-status.dto';
 import { AssignRiderDto } from './dto/assign-rider.dto';
 import { PaginationDto } from '../common/dto/pagination.dto';
 import { PushService } from '../push/push.service';
+import { MailService } from '../mail/mail.service';
 
 const RIDER_ACTIVE_STATUSES = ['assigned', 'picked_up', 'in_transit'];
+
+// Rider states the office must hear about: how each job ended.
+const OFFICE_DELIVERY_STATES = new Set(['delivered', 'failed', 'returned']);
 
 function startOfToday(): Date {
   const d = new Date();
@@ -19,6 +23,7 @@ export class DeliveriesService {
   constructor(
     private prisma: PrismaService,
     private push: PushService,
+    private mail: MailService,
   ) {}
 
   async findAll(pagination: PaginationDto, branchId?: string, riderId?: string, status?: string) {
@@ -290,6 +295,31 @@ export class DeliveriesService {
           },
         })
         .catch(() => undefined);
+    }
+
+    // Terminal rider actions (delivered / failed / returned) are emailed to
+    // the official inbox so the front desk reconciles cash and re-dispatch.
+    if (OFFICE_DELIVERY_STATES.has(String(dto.status))) {
+      const rider = await this.prisma.user
+        .findUnique({ where: { id: userId }, select: { fullName: true, phone: true } })
+        .catch(() => null);
+      const labels: Record<string, string> = {
+        delivered: 'Delivery Completed',
+        failed: 'Delivery Failed',
+        returned: 'Delivery Returned',
+      };
+      this.mail.notifyOffice(labels[String(dto.status)], {
+        'Order Number': updated.order?.orderNumber,
+        Customer: updated.order?.customer?.fullName,
+        Phone: updated.order?.customer?.phone,
+        Rider: rider?.fullName ? `${rider.fullName}${rider.phone ? ` (${rider.phone})` : ''}` : undefined,
+        Collected:
+          dto.status === 'delivered'
+            ? `NGN ${Number(dto.amountCollected ?? order?.totalAmount ?? 0).toLocaleString('en-NG')}${dto.paymentMethod ? ` via ${dto.paymentMethod}` : ''}`
+            : undefined,
+        'Failure Reason': dto.status === 'failed' ? dto.failureReason : undefined,
+        Note: dto.riderNote,
+      });
     }
 
     return updated;

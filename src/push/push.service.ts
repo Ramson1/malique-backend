@@ -30,7 +30,7 @@ export class PushService {
     if (publicKey && privateKey) {
       webpush.setVapidDetails(
         this.configService.get<string>('VAPID_SUBJECT') ||
-          'mailto:info@maliqueoilgas.com',
+          'mailto:maliqueoilandgasltd@gmail.com',
         publicKey,
         privateKey,
       );

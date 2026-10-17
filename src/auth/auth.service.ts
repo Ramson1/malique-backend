@@ -198,6 +198,14 @@ export class AuthService {
       },
     });
 
+    // Welcome alert to the official inbox — sales can follow up on new signups.
+    this.mailService.notifyOffice('New Customer Sign-up', {
+      Name: customer.fullName,
+      Email: customer.email,
+      Phone: customer.phone,
+      Address: dto.address,
+    });
+
     const payload = {
       sub: customer.id,
       email: customer.email,

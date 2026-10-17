@@ -52,12 +52,13 @@ export const DELIVERY_STATUS_TO_UI: Record<string, string> = {
   in_transit: 'delivering',
   delivered: 'delivered',
   failed: 'pending',
-  returned: 'pending',
+  returned: 'cancelled',
 };
 export const DELIVERY_STATUS_TO_DB: Record<string, string> = {
   pending: 'assigned',
   delivering: 'in_transit',
   delivered: 'delivered',
+  cancelled: 'returned',
 };
 
 // Staff role: DB enum <-> admin UI token.

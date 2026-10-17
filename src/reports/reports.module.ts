@@ -3,11 +3,12 @@ import { ReportsController } from './reports.controller';
 import { ReportsService } from './reports.service';
 import { GasModule } from '../gas/gas.module';
 import { PayrollModule } from '../payroll/payroll.module';
+import { AdminModule } from '../admin/admin.module';
 
-// PrismaModule is @Global; GasService + PayrollService are re-used here so the
+// PrismaModule is @Global; GasService + PayrollService are re-used here so the 
 // gas-balance and payroll reports share exactly the same engine as their pages.
 @Module({
-  imports: [GasModule, PayrollModule],
+  imports: [GasModule, PayrollModule, AdminModule],
   controllers: [ReportsController],
   providers: [ReportsService],
 })

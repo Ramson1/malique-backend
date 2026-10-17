@@ -7,6 +7,7 @@ import {
 import * as bcrypt from 'bcrypt';
 import * as crypto from 'crypto';
 import { PrismaService } from '../prisma/prisma.service';
+import { MailService } from '../mail/mail.service';
 import {
   CreateSaleDto,
   PosSalesQueryDto,
@@ -24,7 +25,10 @@ interface AuthUser {
 
 @Injectable()
 export class PosService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly mail: MailService,
+  ) {}
 
   // ─── Branch scoping ────────────────────────────────────────
   // staff/branch_manager are locked to their own branch; admin/super_admin may
@@ -265,7 +269,26 @@ export class PosService {
           // rows if called inside the transaction callback.
           return order.id;
         });
-        return this.findOne(user, createdId);
+        const sale = await this.findOne(user, createdId);
+        // Alert the official inbox on every counter sale — this same flow
+        // backs the admin portal's "New Order", so both are covered.
+        const cashier = await this.prisma.user
+          .findUnique({ where: { id: user.id }, select: { fullName: true } })
+          .catch(() => null);
+        this.mail.notifyOffice('New Counter Sale', {
+          'Order Number': sale.orderNumber,
+          Branch: sale.branch?.name,
+          Cashier: cashier?.fullName ?? 'Staff',
+          Customer: sale.customer?.phone
+            ? `${sale.customer.fullName} (${sale.customer.phone})`
+            : 'Walk-in',
+          Items: sale.items
+            .map((it: any) => `${it.quantity} × ${it.product?.name ?? 'Item'} (${it.sizeKg}kg)`)
+            .join(', '),
+          Total: `NGN ${Number(sale.totalAmount).toLocaleString('en-NG')}`,
+          Payment: `${dto.paymentMethod}${dto.amountPaid != null ? ` — paid NGN ${Number(dto.amountPaid).toLocaleString('en-NG')}` : ''}`,
+        });
+        return sale;
       } catch (err) {
         // Retry once if two concurrent sales grabbed the same order number.
         if (attempt === 0 && isUniqueViolation(err)) continue;
@@ -375,6 +398,13 @@ export class PosService {
         where: { orderId: id },
         data: { status: 'refunded' },
       });
+    });
+
+    // Money left the drawer — make sure the official inbox sees every void.
+    this.mail.notifyOffice('POS Sale Voided', {
+      'Order Number': order.orderNumber,
+      'Total Refunded': `NGN ${Number(order.totalAmount).toLocaleString('en-NG')}`,
+      Reason: dto.reason,
     });
 
     return this.findOne(user, id);

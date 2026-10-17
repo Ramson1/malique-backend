@@ -1,6 +1,7 @@
 import {
   Body,
   Controller,
+  Delete,
   Get,
   Param,
   Patch,
@@ -10,6 +11,7 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import { AdminService } from './admin.service';
+import { PosService } from '../pos/pos.service';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../common/guards/roles.guard';
 import { Roles } from '../common/decorators/roles.decorator';
@@ -21,7 +23,10 @@ import { CurrentUser } from '../common/decorators/current-user.decorator';
 @UseGuards(JwtAuthGuard, RolesGuard)
 @Roles('super_admin', 'admin', 'branch_manager', 'staff')
 export class AdminController {
-  constructor(private readonly adminService: AdminService) {}
+  constructor(
+    private readonly adminService: AdminService,
+    private readonly posService: PosService,
+  ) {}
 
   // Dashboard + analytics
   @Get('dashboard/stats')
@@ -82,6 +87,14 @@ export class AdminController {
     return this.adminService.updateOrderStatus(id, body);
   }
 
+  // Manual order entry — delegates to the same sale flow the staff POS uses
+  // (walk-in or registered customer, pricing, stock deduction, notifications).
+  @Post('orders')
+  @Roles('super_admin', 'admin', 'branch_manager', 'staff')
+  createOrder(@CurrentUser() user: any, @Body() body: any) {
+    return this.posService.createSale(user, body);
+  }
+
   // Staff
   @Get('staff')
   listStaff() {
@@ -121,21 +134,21 @@ export class AdminController {
 
   @Post('products')
   @Roles('super_admin', 'admin', 'branch_manager')
-  createProduct(@Body() body: any) {
-    return this.adminService.createProduct(body);
+  createProduct(@CurrentUser() user: any, @Body() body: any) {
+    return this.adminService.createProduct(user, body);
   }
 
   @Patch('products/:id')
   @Roles('super_admin', 'admin', 'branch_manager')
-  updateProduct(@Param('id') id: string, @Body() body: any) {
-    return this.adminService.updateProduct(id, body);
+  updateProduct(@CurrentUser() user: any, @Param('id') id: string, @Body() body: any) {
+    return this.adminService.updateProduct(user, id, body);
   }
 
   // Global price control — per-size prices for one/all branches.
   @Put('products/:id/prices')
   @Roles('super_admin', 'admin', 'branch_manager')
-  setProductPrices(@Param('id') id: string, @Body() body: any) {
-    return this.adminService.setProductPrices(id, body);
+  setProductPrices(@CurrentUser() user: any, @Param('id') id: string, @Body() body: any) {
+    return this.adminService.setProductPrices(user, id, body);
   }
 
   // Branches
@@ -156,10 +169,35 @@ export class AdminController {
     return this.adminService.updateBranch(id, body);
   }
 
+  // Soft archive: flips the branch to `inactive`; reactivate via PATCH.
+  @Delete('branches/:id')
+  @Roles('super_admin', 'admin')
+  deleteBranch(@Param('id') id: string) {
+    return this.adminService.deleteBranch(id);
+  }
+
   // Customers
   @Get('customers')
   listCustomers() {
     return this.adminService.listCustomers();
+  }
+
+  @Post('customers')
+  @Roles('super_admin', 'admin', 'branch_manager')
+  createCustomer(@Body() body: any) {
+    return this.adminService.createCustomer(body);
+  }
+
+  @Patch('customers/:id')
+  @Roles('super_admin', 'admin', 'branch_manager')
+  updateCustomer(@Param('id') id: string, @Body() body: any) {
+    return this.adminService.updateCustomer(id, body);
+  }
+
+  @Delete('customers/:id')
+  @Roles('super_admin', 'admin')
+  deleteCustomer(@Param('id') id: string) {
+    return this.adminService.deleteCustomer(id);
   }
 
   // Deliveries
@@ -191,6 +229,25 @@ export class AdminController {
     return this.adminService.listAttendance();
   }
 
+  // Manual corrections by managers; soft delete keeps payroll history sane.
+  @Post('attendance')
+  @Roles('super_admin', 'admin', 'branch_manager')
+  createAttendance(@Body() body: any) {
+    return this.adminService.createAttendance(body);
+  }
+
+  @Patch('attendance/:id')
+  @Roles('super_admin', 'admin', 'branch_manager')
+  updateAttendance(@Param('id') id: string, @Body() body: any) {
+    return this.adminService.updateAttendance(id, body);
+  }
+
+  @Delete('attendance/:id')
+  @Roles('super_admin', 'admin', 'branch_manager')
+  deleteAttendance(@Param('id') id: string) {
+    return this.adminService.deleteAttendance(id);
+  }
+
   // Inventory
   @Get('inventory')
   listInventory() {
@@ -201,5 +258,23 @@ export class AdminController {
   @Roles('super_admin', 'admin', 'branch_manager', 'staff')
   adjustInventory(@Body() body: any) {
     return this.adminService.adjustInventory(body);
+  }
+
+  @Post('inventory/items')
+  @Roles('super_admin', 'admin', 'branch_manager')
+  createInventoryItem(@Body() body: any) {
+    return this.adminService.createInventory(body);
+  }
+
+  @Patch('inventory/items/:id')
+  @Roles('super_admin', 'admin', 'branch_manager')
+  updateInventoryItem(@Param('id') id: string, @Body() body: any) {
+    return this.adminService.updateInventory(id, body);
+  }
+
+  @Delete('inventory/items/:id')
+  @Roles('super_admin', 'admin', 'branch_manager')
+  deleteInventoryItem(@Param('id') id: string) {
+    return this.adminService.deleteInventory(id);
   }
 }

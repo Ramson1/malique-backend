@@ -48,6 +48,14 @@ export class MessagesService {
         relatedOrderId: dto.relatedOrderId ?? null,
       },
     });
+    // Ping the official inbox the moment a website enquiry lands.
+    this.mail.notifyOffice('New Customer Enquiry', {
+      Name: dto.name ?? 'Anonymous',
+      Email: dto.email,
+      Phone: dto.phone,
+      Subject: dto.subject ?? 'General enquiry',
+      Message: dto.message.slice(0, 800),
+    });
     return { id: created.id, ok: true };
   }
 

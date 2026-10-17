@@ -148,6 +148,20 @@ export class OrdersService {
       console.error('Failed to send order confirmation email:', error);
     }
 
+    // Alert the official company inbox about the new web order (fire-and-forget).
+    this.mailService.notifyOffice('New Website Order', {
+      'Order Number': order.orderNumber,
+      Customer: order.customer.fullName,
+      Phone: order.customer.phone,
+      Email: order.customer.email,
+      Branch: order.branch?.name,
+      Items: order.items
+        .map((it: any) => `${it.quantity} × ${it.product?.name ?? 'Item'} (${it.sizeKg}kg)`)
+        .join(', '),
+      Total: `NGN ${Number(totalAmount).toLocaleString('en-NG')}`,
+      Delivery: dto.deliveryAddress ?? 'Customer pickup',
+    });
+
     return order;
   }
 
@@ -236,6 +250,19 @@ export class OrdersService {
 
     if (dto.status === 'delivered') {
       updateData.deliveredAt = new Date();
+    }
+
+    // Keep the office inbox posted on order lifecycle changes (notably
+    // customer cancellations from the website). Fire-and-forget.
+    if (dto.status !== order.status) {
+      this.mailService.notifyOffice('Order Status Changed', {
+        'Order Number': order.orderNumber,
+        Customer: order.customer.fullName,
+        Phone: order.customer.phone,
+        Previous: order.status,
+        New: dto.status,
+        Reason: dto.status === 'cancelled' ? dto.cancelReason : undefined,
+      });
     }
 
     return this.prisma.order.update({

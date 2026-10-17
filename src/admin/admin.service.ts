@@ -1,8 +1,10 @@
 import { Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
 import * as bcrypt from 'bcrypt';
+import * as crypto from 'crypto';
 import * as QRCode from 'qrcode';
 import { PrismaService } from '../prisma/prisma.service';
 import { PushService } from '../push/push.service';
+import { MailService } from '../mail/mail.service';
 import { generateStaffCode, signBadgeToken } from '../attendance/checkin-token';
 import {
   num,
@@ -35,6 +37,7 @@ export class AdminService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly push: PushService,
+    private readonly mail: MailService,
   ) {}
 
   // ─── Dashboard ─────────────────────────────────────────
@@ -45,7 +48,7 @@ export class AdminService {
     const [totalOrders, totalCustomers, activeBranches, revenueAgg, monthlyAgg] =
       await Promise.all([
         this.prisma.order.count(),
-        this.prisma.customer.count(),
+        this.prisma.customer.count({ where: { deletedAt: null } }),
         this.prisma.branch.count({ where: { status: 'active' } }),
         this.prisma.order.aggregate({
           where: { paymentStatus: 'paid' },
@@ -319,8 +322,8 @@ export class AdminService {
 
     const [activeBranches, totalCustomers, clockedInNow] = await Promise.all([
       this.prisma.branch.count({ where: { status: 'active' } }),
-      this.prisma.customer.count(),
-      this.prisma.attendance.count({ where: { clockOut: null } }),
+      this.prisma.customer.count({ where: { deletedAt: null } }),
+      this.prisma.attendance.count({ where: { clockOut: null, deletedAt: null } }),
     ]);
 
     // Recent orders + low stock (respect branch scope for context).
@@ -338,7 +341,7 @@ export class AdminService {
         },
       }),
       this.prisma.inventory.findMany({
-        where: { quantityOnHand: { lte: 5 }, ...(query?.branchId ? { branchId: query.branchId } : {}) },
+        where: { deletedAt: null, quantityOnHand: { lte: 5 }, ...(query?.branchId ? { branchId: query.branchId } : {}) },
         take: 8,
         orderBy: { quantityOnHand: 'asc' },
         include: {
@@ -520,6 +523,14 @@ export class AdminService {
       data,
       include: { customer: true, branch: true },
     });
+    // Admin-side status moves are mirrored to the official inbox.
+    this.mail.notifyOffice('Order Status Updated (Admin)', {
+      'Order Number': updated.orderNumber,
+      Customer: updated.customer?.fullName,
+      Branch: updated.branch?.name,
+      New: body?.status ?? dbStatus,
+      Reason: dbStatus === 'cancelled' ? body?.cancelReason : undefined,
+    });
     return this.mapOrderSummary(updated);
   }
 
@@ -579,7 +590,16 @@ export class AdminService {
       },
       include: { branch: { select: { name: true } } },
     });
-    return this.mapStaff(created);
+    const staff = this.mapStaff(created);
+    // Let the official inbox know a new team member was onboarded.
+    this.mail.notifyOffice('New Staff Account Created', {
+      Name: `${staff.firstName} ${staff.lastName}`.trim(),
+      Email: staff.email,
+      Role: staff.role,
+      Branch: staff.branchName,
+      'Job Title': staff.jobTitle,
+    });
+    return staff;
   }
 
   async updateStaff(id: string, body: any) {
@@ -653,8 +673,18 @@ export class AdminService {
 
   // ─── Products ──────────────────────────────────────────
   async listProducts() {
-    const rows = await this.prisma.product.findMany({ orderBy: { createdAt: 'desc' } });
-    return { products: rows.map((p: any) => this.mapProduct(p)) };
+    const [rows, pending] = await Promise.all([
+      this.prisma.product.findMany({ orderBy: { createdAt: 'desc' } }),
+      this.prisma.productChangeRequest.findMany({
+        where: { status: 'pending', productId: { not: null } },
+        select: { productId: true },
+        distinct: ['productId'],
+      }),
+    ]);
+    return {
+      products: rows.map((p: any) => this.mapProduct(p)),
+      pendingProductIds: pending.map((r: any) => r.productId),
+    };
   }
 
   private mapProduct(p: any) {
@@ -687,7 +717,7 @@ export class AdminService {
     return data;
   }
 
-  async createProduct(body: any) {
+  async createProduct(user: any, body: any) {
     const data = this.productData(body);
     const created = await this.prisma.product.create({
       data: {
@@ -695,13 +725,23 @@ export class AdminService {
         category: data.category ?? 'refill',
       },
     });
+    // Direct admin/manager edit supersedes any pending proposals for this
+    // product — the approval queue should never review stale changes.
+    await this.prisma.productChangeRequest.updateMany({
+      where: { productId: created.id, status: 'pending' },
+      data: { status: 'superseded', reason: `Applied directly by ${user?.fullName ?? 'an administrator'}` },
+    });
     return this.mapProduct(created);
   }
 
-  async updateProduct(id: string, body: any) {
+  async updateProduct(user: any, id: string, body: any) {
     const updated = await this.prisma.product.update({
       where: { id },
       data: this.productData(body),
+    });
+    await this.prisma.productChangeRequest.updateMany({
+      where: { productId: id, status: 'pending' },
+      data: { status: 'superseded', reason: `Applied directly by ${user?.fullName ?? 'an administrator'}` },
     });
     return this.mapProduct(updated);
   }
@@ -709,7 +749,7 @@ export class AdminService {
   // Global price control: upsert per-size ProductPrice rows for one product
   // across either one branch or every active branch. Rows take effect
   // immediately for the website catalog, POS and server-side order pricing.
-  async setProductPrices(id: string, body: any) {
+  async setProductPrices(user: any, id: string, body: any) {
     const product = await this.prisma.product.findUnique({ where: { id } });
     if (!product) {
       throw new NotFoundException('Product not found');
@@ -779,6 +819,11 @@ export class AdminService {
         data: { basePrice: primaryEntry.price },
       });
     }
+
+    await this.prisma.productChangeRequest.updateMany({
+      where: { productId: id, status: 'pending' },
+      data: { status: 'superseded', reason: `Applied directly by ${user?.fullName ?? 'an administrator'}` },
+    });
 
     return { upserted, branches: branchIds.length };
   }
@@ -854,7 +899,10 @@ export class AdminService {
 
   // ─── Customers ─────────────────────────────────────────
   async listCustomers() {
-    const rows = await this.prisma.customer.findMany({ orderBy: { createdAt: 'desc' } });
+    const rows = await this.prisma.customer.findMany({
+      where: { deletedAt: null },
+      orderBy: { createdAt: 'desc' },
+    });
     return {
       customers: rows.map((c: any) => {
         const { firstName, lastName } = splitName(c.fullName);
@@ -865,6 +913,7 @@ export class AdminService {
           email: c.email,
           phone: c.phone ?? '',
           address: c.address ?? '',
+          defaultBranchId: c.defaultBranchId ?? '',
           totalOrders: c.orderCount,
           totalSpent: num(c.totalSpent),
           lastOrderDate: c.updatedAt.toISOString(),
@@ -964,7 +1013,17 @@ export class AdminService {
     const dbStatus = DELIVERY_STATUS_TO_DB[body?.status] ?? body?.status;
     const data: any = { status: dbStatus };
     if (dbStatus === 'delivered') data.deliveredAt = new Date();
-    const updated = await this.prisma.delivery.update({ where: { id }, data });
+    const updated = await this.prisma.delivery.update({
+      where: { id },
+      data,
+      include: { order: { select: { orderNumber: true } } },
+    });
+    // Cancellations ("returned") and admin closures reach the official inbox.
+    this.mail.notifyOffice('Delivery Status Updated (Admin)', {
+      'Order Number': updated.order?.orderNumber,
+      New: body?.status ?? dbStatus,
+      Note: body?.notes,
+    });
     return {
       id: updated.id,
       status: DELIVERY_STATUS_TO_UI[updated.status] ?? updated.status,
@@ -974,6 +1033,7 @@ export class AdminService {
   // ─── Attendance ────────────────────────────────────────
   async listAttendance() {
     const rows = await this.prisma.attendance.findMany({
+      where: { deletedAt: null },
       orderBy: { clockIn: 'desc' },
       take: 200,
       include: {
@@ -984,6 +1044,10 @@ export class AdminService {
     return {
       records: rows.map((a: any) => ({
         id: a.id,
+        userId: a.userId,
+        branchId: a.branchId,
+        shiftType: a.shiftType,
+        attendanceStatus: a.status,
         staffName: a.user?.fullName ?? '—',
         staffEmail: a.user?.email ?? '',
         branchName: a.branch?.name ?? '—',
@@ -992,6 +1056,7 @@ export class AdminService {
         clockOut: a.clockOut ? a.clockOut.toISOString() : null,
         status: a.clockOut ? 'clocked_out' : 'clocked_in',
         totalHours: num(a.totalHours),
+        notes: a.notes ?? '',
       })),
     };
   }
@@ -999,6 +1064,7 @@ export class AdminService {
   // ─── Inventory ─────────────────────────────────────────
   async listInventory() {
     const rows = await this.prisma.inventory.findMany({
+      where: { deletedAt: null },
       orderBy: { quantityOnHand: 'asc' },
       include: {
         product: { select: { name: true } },
@@ -1021,8 +1087,8 @@ export class AdminService {
   }
 
   async adjustInventory(body: any) {
-    const item = await this.prisma.inventory.findUnique({
-      where: { id: body.inventoryId },
+    const item = await this.prisma.inventory.findFirst({
+      where: { id: body.inventoryId, deletedAt: null },
     });
     if (!item) throw new NotFoundException('Inventory item not found');
     const delta = Number(body.quantity) || 0;
@@ -1039,5 +1105,280 @@ export class AdminService {
       currentStock: updated.quantityOnHand,
       status: inventoryStatus(updated.quantityOnHand, updated.minStockLevel),
     };
+  }
+
+  // ─── Customers CRUD ────────────────────────────────────
+  // Admin-side customer management. Deletes are soft (deletedAt) so past
+  // orders keep their customer reference intact.
+  async createCustomer(body: any) {
+    const fullName =
+      `${body?.firstName ?? ''} ${body?.lastName ?? ''}`.trim() ||
+      String(body?.fullName ?? '').trim();
+    if (!fullName) throw new BadRequestException('Customer name is required');
+    const email = String(body?.email ?? '').trim().toLowerCase();
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email))
+      throw new BadRequestException('A valid email is required');
+    const phone = String(body?.phone ?? '').trim();
+    if (!phone) throw new BadRequestException('Phone number is required');
+    const existing = await this.prisma.customer.findUnique({ where: { email } });
+    if (existing) throw new BadRequestException('A customer with this email already exists');
+    if (body?.defaultBranchId) {
+      const branch = await this.prisma.branch.findUnique({
+        where: { id: body.defaultBranchId },
+        select: { id: true },
+      });
+      if (!branch) throw new BadRequestException('Unknown branch');
+    }
+    // Admin-created customers may arrive without a password; give them a random
+    // one so the account is valid and the email reset flow can take over.
+    const password = await bcrypt.hash(
+      String(body?.password ?? '').trim() || crypto.randomUUID(),
+      10,
+    );
+    const created = await this.prisma.customer.create({
+      data: {
+        fullName,
+        email,
+        phone,
+        address: String(body?.address ?? '').trim() || null,
+        defaultBranchId: body?.defaultBranchId || null,
+        password,
+      },
+    });
+    const { firstName, lastName } = splitName(created.fullName);
+    return {
+      id: created.id,
+      firstName,
+      lastName,
+      email: created.email,
+      phone: created.phone,
+      address: created.address ?? '',
+      totalOrders: created.orderCount,
+      totalSpent: num(created.totalSpent),
+      createdAt: created.createdAt.toISOString(),
+    };
+  }
+
+  async updateCustomer(id: string, body: any) {
+    const current = await this.prisma.customer.findFirst({
+      where: { id, deletedAt: null },
+    });
+    if (!current) throw new NotFoundException('Customer not found');
+    const data: any = {};
+    const fullName =
+      body?.firstName || body?.lastName
+        ? `${body?.firstName ?? ''} ${body?.lastName ?? ''}`.trim()
+        : String(body?.fullName ?? '').trim();
+    if (fullName) data.fullName = fullName;
+    if (body?.email) {
+      const email = String(body.email).trim().toLowerCase();
+      if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email))
+        throw new BadRequestException('A valid email is required');
+      const clash = await this.prisma.customer.findFirst({
+        where: { email, NOT: { id } },
+      });
+      if (clash) throw new BadRequestException('Another customer already uses this email');
+      data.email = email;
+    }
+    if (body?.phone != null) data.phone = String(body.phone).trim();
+    if (body?.address != null) data.address = String(body.address).trim() || null;
+    if (body?.defaultBranchId !== undefined) {
+      if (body.defaultBranchId) {
+        const branch = await this.prisma.branch.findUnique({
+          where: { id: body.defaultBranchId },
+          select: { id: true },
+        });
+        if (!branch) throw new BadRequestException('Unknown branch');
+      }
+      data.defaultBranchId = body.defaultBranchId || null;
+    }
+    if (body?.notes != null) data.notes = String(body.notes);
+    if (String(body?.password ?? '').trim()) {
+      data.password = await bcrypt.hash(String(body.password).trim(), 10);
+    }
+    const updated = await this.prisma.customer.update({ where: { id }, data });
+    const { firstName, lastName } = splitName(updated.fullName);
+    return {
+      id: updated.id,
+      firstName,
+      lastName,
+      email: updated.email,
+      phone: updated.phone,
+      address: updated.address ?? '',
+      totalOrders: updated.orderCount,
+      totalSpent: num(updated.totalSpent),
+      createdAt: updated.createdAt.toISOString(),
+    };
+  }
+
+  async deleteCustomer(id: string) {
+    const current = await this.prisma.customer.findFirst({
+      where: { id, deletedAt: null },
+    });
+    if (!current) throw new NotFoundException('Customer not found');
+    await this.prisma.customer.update({ where: { id }, data: { deletedAt: new Date() } });
+    return { id, deleted: true };
+  }
+
+  // ─── Attendance CRUD (manual corrections) ──────────────
+  private static readonly ATTENDANCE_STATUSES = ['present', 'late', 'absent', 'half_day'];
+  private static readonly SHIFT_TYPES = ['morning', 'afternoon', 'night', 'full_day'];
+
+  private buildAttendanceData(body: any, existing?: any) {
+    const data: any = {};
+    const clockIn = body?.clockIn ? new Date(body.clockIn) : undefined;
+    if (clockIn && Number.isNaN(clockIn.getTime()))
+      throw new BadRequestException('clockIn is not a valid date');
+    const clockOut =
+      body?.clockOut === null ? null : body?.clockOut ? new Date(body.clockOut) : undefined;
+    if (clockOut && Number.isNaN(clockOut.getTime()))
+      throw new BadRequestException('clockOut is not a valid date');
+    if (clockIn) data.clockIn = clockIn;
+    if (clockOut !== undefined) data.clockOut = clockOut;
+    // Recompute worked hours whenever either endpoint is (re)supplied.
+    const start = data.clockIn ?? existing?.clockIn ?? null;
+    const end = clockOut !== undefined ? data.clockOut : existing?.clockOut ?? null;
+    if (start && end) {
+      if (new Date(end) <= new Date(start))
+        throw new BadRequestException('clockOut must be after clockIn');
+      data.totalHours = Math.round(((new Date(end).getTime() - new Date(start).getTime()) / 3_600_000) * 100) / 100;
+    } else if (clockOut === null) {
+      data.totalHours = 0;
+    }
+    if (body?.status) {
+      if (!AdminService.ATTENDANCE_STATUSES.includes(body.status))
+        throw new BadRequestException(`status must be one of: ${AdminService.ATTENDANCE_STATUSES.join(', ')}`);
+      data.status = body.status;
+    }
+    if (body?.shiftType) {
+      if (!AdminService.SHIFT_TYPES.includes(body.shiftType))
+        throw new BadRequestException(`shiftType must be one of: ${AdminService.SHIFT_TYPES.join(', ')}`);
+      data.shiftType = body.shiftType;
+    }
+    if (body?.notes != null) data.notes = String(body.notes);
+    return data;
+  }
+
+  async createAttendance(body: any) {
+    if (!body?.userId) throw new BadRequestException('staff member is required');
+    if (!body?.branchId) throw new BadRequestException('branch is required');
+    if (!body?.clockIn) throw new BadRequestException('clock-in time is required');
+    const user = await this.prisma.user.findUnique({
+      where: { id: body.userId },
+      select: { id: true, role: true },
+    });
+    // The User table only holds staff/rider accounts, so any hit is loggable.
+    if (!user) throw new BadRequestException('Unknown staff member');
+    const branch = await this.prisma.branch.findUnique({
+      where: { id: body.branchId },
+      select: { id: true },
+    });
+    if (!branch) throw new BadRequestException('Unknown branch');
+    const data = this.buildAttendanceData(body);
+    const created = await this.prisma.attendance.create({
+      data: { ...data, userId: body.userId, branchId: body.branchId, pinVerified: true },
+    });
+    return { id: created.id, status: created.status, totalHours: num(created.totalHours) };
+  }
+
+  async updateAttendance(id: string, body: any) {
+    const current = await this.prisma.attendance.findFirst({
+      where: { id, deletedAt: null },
+    });
+    if (!current) throw new NotFoundException('Attendance record not found');
+    const data = this.buildAttendanceData(body, current);
+    const updated = await this.prisma.attendance.update({ where: { id }, data });
+    return { id: updated.id, status: updated.status, totalHours: num(updated.totalHours) };
+  }
+
+  async deleteAttendance(id: string) {
+    const current = await this.prisma.attendance.findFirst({
+      where: { id, deletedAt: null },
+    });
+    if (!current) throw new NotFoundException('Attendance record not found');
+    await this.prisma.attendance.update({ where: { id }, data: { deletedAt: new Date() } });
+    return { id, deleted: true };
+  }
+
+  // ─── Branches / Inventory soft CRUD ────────────────────
+  async deleteBranch(id: string) {
+    const branch = await this.prisma.branch.findUnique({ where: { id }, select: { id: true } });
+    if (!branch) throw new NotFoundException('Branch not found');
+    await this.prisma.branch.update({ where: { id }, data: { status: 'inactive' } });
+    return { id, status: 'inactive' };
+  }
+
+  async createInventory(body: any) {
+    const { productId, branchId } = body ?? {};
+    const sizeKg = Number(body?.sizeKg);
+    if (!productId || !branchId || !Number.isFinite(sizeKg) || sizeKg <= 0)
+      throw new BadRequestException('productId, branchId and sizeKg are required');
+    const product = await this.prisma.product.findUnique({
+      where: { id: productId },
+      select: { id: true },
+    });
+    if (!product) throw new BadRequestException('Unknown product');
+    const branch = await this.prisma.branch.findUnique({
+      where: { id: branchId },
+      select: { id: true },
+    });
+    if (!branch) throw new BadRequestException('Unknown branch');
+    const clash = await this.prisma.inventory.findFirst({
+      where: { branchId, productId, sizeKg },
+    });
+    if (clash && clash.deletedAt) {
+      // Revive the archived stock row instead of violating the unique index.
+      const revived = await this.prisma.inventory.update({
+        where: { id: clash.id },
+        data: {
+          deletedAt: null,
+          quantityOnHand: Math.max(0, Number(body?.quantityOnHand) || clash.quantityOnHand),
+          minStockLevel: Number(body?.minStockLevel ?? clash.minStockLevel),
+          maxCapacity: Number(body?.maxCapacity ?? clash.maxCapacity),
+        },
+      });
+      return { id: revived.id, currentStock: revived.quantityOnHand };
+    }
+    if (clash) throw new BadRequestException('A stock record for this product, branch and size already exists');
+    const created = await this.prisma.inventory.create({
+      data: {
+        productId,
+        branchId,
+        sizeKg,
+        quantityOnHand: Math.max(0, Number(body?.quantityOnHand) || 0),
+        minStockLevel: Number(body?.minStockLevel ?? 5),
+        maxCapacity: Number(body?.maxCapacity ?? 500),
+        ...(Number(body?.quantityOnHand) > 0 ? { lastRestockedAt: new Date() } : {}),
+      },
+    });
+    return { id: created.id, currentStock: created.quantityOnHand };
+  }
+
+  async updateInventory(id: string, body: any) {
+    const item = await this.prisma.inventory.findFirst({ where: { id, deletedAt: null } });
+    if (!item) throw new NotFoundException('Inventory item not found');
+    const data: any = {};
+    if (body?.currentStock != null) {
+      const qty = Math.max(0, Number(body.currentStock) || 0);
+      if (qty > item.quantityOnHand) data.lastRestockedAt = new Date();
+      data.quantityOnHand = qty;
+    }
+    if (body?.minStockLevel != null) data.minStockLevel = Math.max(0, Number(body.minStockLevel) || 0);
+    if (body?.maxCapacity != null) data.maxCapacity = Math.max(1, Number(body.maxCapacity) || 1);
+    const updated = await this.prisma.inventory.update({ where: { id }, data });
+    return {
+      id: updated.id,
+      currentStock: updated.quantityOnHand,
+      minStock: updated.minStockLevel,
+      maxStock: updated.maxCapacity,
+      status: inventoryStatus(updated.quantityOnHand, updated.minStockLevel),
+    };
+  }
+
+  async deleteInventory(id: string) {
+    const item = await this.prisma.inventory.findFirst({ where: { id, deletedAt: null } });
+    if (!item) throw new NotFoundException('Inventory item not found');
+    await this.prisma.inventory.update({ where: { id }, data: { deletedAt: new Date() } });
+    return { id, deleted: true };
   }
 }
