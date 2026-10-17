@@ -35,8 +35,10 @@ function isAllowedOrigin(origin?: string): boolean {
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
 
-  // Keep the untouched JSON bytes for webhook signature verification
-  // (Paystack signs the raw body with HMAC-SHA512). `useBodyParser` lives on
+  // Keep the untouched JSON bytes available for webhook signature
+  // verification (Flutterwave's payments webhook authenticates via a plain
+  // `verif-hash` header, but raw-body capture stays for any future HMAC
+  // gateway). `useBodyParser` lives on
   // the concrete NestApplication class, not the INestApplication interface.
   (app as NestApplication).useBodyParser('json', {
     verify: (req: any, _res, buf) => {
